@@ -1,0 +1,67 @@
+# fuelbench bash autocomplete
+
+## Main function
+function _fuelbench() {
+	local cur prev subcommand
+	local opts1 opts_install opts_restore opts_create opts_deploy opts_clean
+	
+	opts1="create deploy install restore clean -h --help"
+	opts_install="--site --iso --master-cpu --master-ram --master-disk --disable-snapshot -N -y --assumeyes -h --help"
+	opts_create="-h --help -y --assumeyes --site --iso --master-cpu --master-ram --master-disk --disable-snapshot -N --controller --controller-cpu --controller-ram --controller-disk --compute --compute-cpu --compute-ram --compute-disk --storage --storage-cpu --storage-ram --storage-disk --env-name --release --rel --mode --network"	
+	opts_deploy="-h --help -y --assumeyes --site --controller --controller-cpu --controller-ram --controller-disk --compute --compute-cpu --compute-ram --compute-disk --storage --storage-cpu --storage-ram --storage-disk --env-name --release --rel --mode --network"
+	opts_restore="-h --help -y --assumeyes --site"
+	opts_clean="--site -y --assumeyes -h --help"
+
+	COMPREPLY=()
+
+	cur="${COMP_WORDS[COMP_CWORD]}"
+	prev="${COMP_WORDS[COMP_CWORD-1]}"
+	subcommand="${COMP_WORDS[1]}"
+
+	case ${prev} in
+		--iso)
+			COMPREPLY=($(compgen -f -- "${cur}"))
+			return 0
+			;;
+	    --release|--rel)
+			COMPREPLY=($(compgen -W "ubuntu centos" -- ${cur}))
+			return 0
+			;;
+		--mode)
+			COMPREPLY=($(compgen -W "ha" -- ${cur}))
+			return 0
+			;;
+		--network)
+			COMPREPLY=($(compgen -W "nova neutron-vlan neutron-gre"))
+			return 0
+			;;
+		--site|--master-cpu|--master-ram|--master-disk|--controller|--controller-cpu|--controller-ram|--controller-disk|--compute|--compute-cpu|--compute-ram|--compute-disk|--storage|--storage-cpu|--storage-ram|--storage-disk|--env-name)
+			return 0
+			;;
+	esac
+
+	if [ $COMP_CWORD = 1 ]; then
+		COMPREPLY=($(compgen -W "${opts1}" -- ${cur}))
+		return 0
+	else
+		case ${subcommand} in
+			create)
+				COMPREPLY=($(compgen -W "${opts_create}" -- ${cur}))
+				;;
+			deploy)
+				COMPREPLY=($(compgen -W "${opts_deploy}" -- ${cur}))
+				;;
+			install)
+				COMPREPLY=($(compgen -W "${opts_install}" -- ${cur}))
+				;;
+			restore)
+				COMPREPLY=($(compgen -W "${opts_restore}" -- ${cur}))
+				;;
+			clean)
+				COMPREPLY=($(compgen -W "${opts_clean}" -- ${cur}))
+				;;
+		esac
+		return 0
+	fi
+}
+complete -F _fuelbench fuelbench

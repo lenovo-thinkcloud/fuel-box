@@ -1,0 +1,5 @@
+
+*.pyc
+
+/iso/*.iso
+/log/*.log

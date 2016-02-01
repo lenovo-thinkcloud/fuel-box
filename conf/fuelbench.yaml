@@ -1,0 +1,19 @@
+global:
+        admin: ['root', 'joey', 'chark', 'xiangyang']
+        fuel_version_file: 'version.yaml'
+        max_site_id: 99
+        site_limit: 10
+        node_limit: 10
+        admin_network_ip: '10.20.{0}.{1}'
+        public_network_ip: '172.16.{0}.{1}'
+        vm_install_wait: 45
+        storage_pool: 'default'
+        search_domain: 'lenovo.com'
+profiles:
+        joey:
+                site: 1
+        chark:
+                site: 2
+        xiangyang:
+                site: 3
+        

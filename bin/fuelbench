@@ -1,0 +1,592 @@
+#!/usr/bin/env python
+
+#    Copyright 2015 Lenovo, Inc.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+#
+#    Author: Joey Zhang <zhangzhuo4@lenovo.com>
+#            Yang Xiang <xiangyang1@lenovo.com>
+
+from __future__ import print_function
+
+import sys
+import os
+import time
+from datetime import datetime
+import string
+import argparse
+import re
+import logging
+import getpass
+import traceback
+
+sys.path.append(os.path.realpath(os.path.join(os.path.dirname(__file__), '..', 'lib')))
+
+from fuelbench import config_manager
+from fuelbench import *
+from fuelbench import utils
+from fuelbench import settings
+
+APP_VERSION = '1.0.0'
+
+def print_master_info(runner):
+	print('%-20s: %d' % ('Site', runner.site))
+	print('%-20s: %s' % ('Base ISO', runner.base_iso))
+	print('%-20s: %s' % ('Fuel Version', runner.iso_fuel_version))
+	print()
+	
+def print_site_info(runner):
+	master_nodes = runner.get_master_nodes()
+	slave_nodes = runner.get_slave_nodes()
+	networks = runner.get_networks()
+	
+	print('%-20s: %d' % ('Site', runner.site))
+	if runner.master_fuel_version:
+		print('%-20s: %s' % ('Fuel Version', runner.master_fuel_version))
+	print('%-20s: %s' % ('Master Node', ' '.join(master_nodes)))
+	print('%-20s: %s' % ('Slave Nodes({0})'.format(len(slave_nodes)), ' '.join(slave_nodes)))
+	print('%-20s: %s' % ('Virtual Networks({0})'.format(len(networks)), ' '.join(networks)))
+	print()
+
+
+def reset_app_start_time():
+	global app_start_time
+	
+	app_start_time = time.time()
+	
+def print_time_summary():
+	global app_start_time
+	
+	total_time = time.time() - app_start_time
+	finish_time = datetime.now()
+	
+	print('Total time: ', end='')
+	
+	hour = round(total_time) / 3600
+	minute = (round(total_time) / 60) % 60
+	second = round(total_time) % 60
+	
+	if hour > 0:
+		print('%02d:%02d:%02d' % (hour, minute, second))
+	elif second > 0:
+		print('%02d:%02d' % (minute, second))
+	else:
+		print('%.1f seconds' % (total_time,))
+	
+	print('Finished at: {0}'.format(finish_time))
+	
+
+def check_current_site(runner, assumeyes):
+	
+	vm_nodes = runner.get_vm_nodes()
+	networks = runner.get_networks()
+	
+	if len(vm_nodes) > 0 or len(networks) > 0:
+		print('Site {0} already exists.'.format(runner.site))
+
+		if assumeyes:
+			return True
+		else:
+			print('Do you really want to reset this site [y/N]:', end='')
+			sys.stdout.flush()
+			answer = sys.stdin.readline()
+
+			if answer.strip().lower() != 'y':
+				return False
+
+	return True
+
+def check_user_site(args, user=None):
+	if not user:
+		user = getpass.getuser()
+			
+	config = config_manager.load(user)
+	max_site_id = config['max_site_id']
+	site_limit = config['site_limit']
+	
+	admin_list = utils.make_list(config.get('admin'))
+	site_list = utils.make_list(config.get('site'))
+	
+	if hasattr(args, 'site'):
+		site = getattr(args, 'site')
+		if site:
+			if site <= 0 or site >= max_site_id:
+				print('Error: site id {0} out of range [1, {1}].'.format(site, max_site_id))
+				sys.exit(1)
+				
+			if site in site_list or \
+				user in admin_list:
+				return site
+			
+			print('Error: permission denied on site {0}.'.format(site))
+			sys.exit(1)
+	
+	if len(site_list) > 0:
+		site = site_list[0]
+		
+		if site <= 0 or site >= max_site_id:
+			print('Error: site id {0} out of range [1, {1}].'.format(site, max_site_id))
+			sys.exit(1)
+		
+		return site
+		 
+	print('Error: site argument is required.')
+	sys.exit(1)	
+	
+def check_deploy_site(assumeyes, site, 
+					total_number, controller_number, compute_number, others_number):
+	
+	print('{total} node(s) (controller={controller}, compute={compute}, others={others}) will be deployed on site {site}'.format(total=total_number,
+																																controller=controller_number,
+																																compute=compute_number,
+																																others=others_number,
+																																site=site))
+	if not assumeyes:
+		print('Are you sure [y/N]:', end='')
+		sys.stdout.flush()
+		answer = sys.stdin.readline()
+		
+		if answer.strip().lower() != 'y':
+			return False
+	
+	return True
+
+
+def discover_fuel_nodes(runner, node_number, timeout=60*15):
+	current = start = time.time()
+	
+	print('Discovering new slave nodes', end='')
+	sys.stdout.flush()
+	
+	last = 0
+	
+	while (current - start) < timeout:
+		pending_nodes = runner.get_pending_fuel_nodes()		
+		total = len(pending_nodes)
+		
+		for i in range(total - last):
+			print('.', end='')
+			sys.stdout.flush()
+		
+		if total >= node_number:
+			print(' OK')
+			return pending_nodes		
+		
+		last = total
+		current = time.time()
+		time.sleep(3)
+	
+	print(' timeout')	
+	raise FuelServerError('Wait for pending nodes timeout')
+
+def split_node_ids(node_list, *args):
+	node_groups = list()
+	
+	avail = node_list
+	for num in args:
+		node_ids = list()
+		for info in avail[:num]:
+			node_ids.append(info['id'])
+		
+		node_groups.append(node_ids)
+		avail = avail[num:]
+	
+	return tuple(node_groups)
+	
+def create_command(args):
+	assumeyes = args.assumeyes
+	site = check_user_site(args)
+	
+	config = config_manager.load()
+	
+	base_iso = utils.getdefattr(args, 'iso', config['default_iso'])
+	master_cpu = utils.getdefattr(args, 'master_cpu')
+	master_ram = utils.getdefattr(args, 'master_ram')
+	master_disk = utils.getdefattr(args, 'master_disk')
+	disable_public = utils.getdefattr(args, 'disable_public', True)	
+	disable_snapshot = utils.getdefattr(args, 'disable_snapshot', False)
+	
+	controller_number = utils.getdefattr(args, 'controller', config['default_controller'])
+	controller_cpu = utils.getdefattr(args, 'controller_cpu', config['controller_cpu'])
+	controller_ram = utils.getdefattr(args, 'controller_ram', config['controller_ram'])
+	controller_disk = utils.getdefattr(args, 'controller_disk', config['controller_disk'])
+	compute_number = utils.getdefattr(args, 'compute', config['default_compute'])
+	compute_cpu = utils.getdefattr(args, 'compute_cpu', config['compute_cpu'])
+	compute_ram = utils.getdefattr(args, 'compute_ram', config['compute_ram'])
+	compute_disk = utils.getdefattr(args, 'compute_disk', config['compute_disk'])
+	storage_number = utils.getdefattr(args, 'storage', config['default_storage'])
+	storage_cpu = utils.getdefattr(args, 'storage_cpu', config['storage_cpu'])
+	storage_ram = utils.getdefattr(args, 'storage_ram', config['storage_ram'])
+	storage_disk = utils.getdefattr(args, 'storage_disk', config['storage_disk'])
+	env_name = utils.getdefattr(args, 'env_name')
+	release_name = utils.getdefattr(args, 'release', 'ubuntu')
+	deploy_mode = utils.getdefattr(args, 'mode', 'ha')
+	network_mode = utils.getdefattr(args, 'network', 'neutron-vlan')
+	
+	total_number = controller_number + compute_number + storage_number
+	others_number = total_number - (controller_number + compute_number)
+	
+	runner = DefaultFuelBench(site, base_iso)
+	runner.check_iso()
+
+	print_master_info(runner)
+
+	if not check_current_site(runner, assumeyes):
+		print('Exiting on user Command')
+		sys.exit(1)	
+		
+	reset_app_start_time()
+	
+	runner.create_master(master_cpu=master_cpu, master_ram=master_ram, master_disk=master_disk,
+						disable_public=disable_public, disable_snapshot=disable_snapshot)
+	
+	runner.wait_for_fuel_server()
+	time.sleep(15)
+	runner.check_master()
+	
+	env_name, env_id = runner.create_fuel_env(env_name, 
+											release=release_name,
+											deploy_mode=deploy_mode,
+											network_mode=network_mode)
+	print("Environment '{name}' with id={id} was created!".format(name=env_name,
+																id=env_id))
+	
+	
+	for i in range(controller_number):
+		if i != 0:
+			time.sleep(30)
+		runner.create_slave(slave_cpu=controller_cpu, slave_ram=controller_ram, slave_disk=controller_disk)
+		
+		
+	for i in range(compute_number):
+		time.sleep(30)
+		runner.create_slave(slave_cpu=compute_cpu, slave_ram=compute_ram, slave_disk=compute_disk)
+		
+	for i in range(storage_number):
+		time.sleep(30)
+		runner.create_slave(slave_cpu=storage_cpu, slave_ram=storage_ram, slave_disk=storage_disk)
+		
+	discovered_nodes = discover_fuel_nodes(runner, total_number)
+	controller_ids, compute_ids, storage_ids = split_node_ids(discovered_nodes, controller_number, compute_number, storage_number)
+	
+	logging.info('controller_ids = ' + str(controller_ids))
+	logging.info('compute_ids = ' + str(compute_ids))
+	logging.info('storage_ids = ' + str(storage_ids))
+	
+	runner.add_fuel_nodes(node_ids=controller_ids, roles=['controller'])
+	runner.add_fuel_nodes(node_ids=compute_ids, roles=['compute'])
+	runner.add_fuel_nodes(node_ids=storage_ids, roles=['cinder'])
+	
+	runner.deploy_changes()
+	
+	runner.print_access_info(show_horizon=True)		
+	
+	print()
+	print('Install and deploy successful!')
+	print_time_summary()
+
+def install_command(args):
+	assumeyes = args.assumeyes
+	site = check_user_site(args)
+	
+	config = config_manager.load()
+		
+	base_iso = utils.getdefattr(args, 'iso', config['default_iso'])
+	master_cpu = utils.getdefattr(args, 'master_cpu')
+	master_ram = utils.getdefattr(args, 'master_ram')
+	master_disk = utils.getdefattr(args, 'master_disk')
+	disable_public = utils.getdefattr(args, 'disable_public', True)
+	disable_snapshot = utils.getdefattr(args, 'disable_snapshot', False)
+
+	runner = DefaultFuelBench(site, base_iso)
+	runner.check_iso()
+
+	print_master_info(runner)
+
+	if not check_current_site(runner, assumeyes):
+		print('Exiting on user Command')
+		sys.exit(1)	
+		
+	reset_app_start_time()
+	
+	runner.create_master(master_cpu=master_cpu, master_ram=master_ram, master_disk=master_disk,
+						disable_public=disable_public, disable_snapshot=disable_snapshot)
+	
+	runner.print_access_info()
+	
+	print()
+	print('Install successful!')
+	print_time_summary()	
+	
+def deploy_command(args):
+	assumeyes = args.assumeyes
+	site = check_user_site(args)
+	
+	config = config_manager.load()
+	
+	controller_number = utils.getdefattr(args, 'controller', config['default_controller'])
+	controller_cpu = utils.getdefattr(args, 'controller_cpu', config['controller_cpu'])
+	controller_ram = utils.getdefattr(args, 'controller_ram', config['controller_ram'])
+	controller_disk = utils.getdefattr(args, 'controller_disk', config['controller_disk'])
+	compute_number = utils.getdefattr(args, 'compute', config['default_compute'])
+	compute_cpu = utils.getdefattr(args, 'compute_cpu', config['compute_cpu'])
+	compute_ram = utils.getdefattr(args, 'compute_ram', config['compute_ram'])
+	compute_disk = utils.getdefattr(args, 'compute_disk', config['compute_disk'])
+	storage_number = utils.getdefattr(args, 'storage', config['default_storage'])
+	storage_cpu = utils.getdefattr(args, 'storage_cpu', config['storage_cpu'])
+	storage_ram = utils.getdefattr(args, 'storage_ram', config['storage_ram'])
+	storage_disk = utils.getdefattr(args, 'storage_disk', config['storage_disk'])
+	env_name = utils.getdefattr(args, 'env_name')
+	release_name = utils.getdefattr(args, 'release', 'ubuntu')
+	deploy_mode = utils.getdefattr(args, 'mode', 'ha')
+	network_mode = utils.getdefattr(args, 'network', 'neutron-vlan')
+	
+	total_number = controller_number + compute_number + storage_number
+	others_number = total_number - (controller_number + compute_number)
+	
+	runner = DefaultFuelBench(site)
+	
+	if runner.is_fuel_server_ready() == False:
+		print('Fuel master server is not available!')
+		sys.exit(1)
+	
+	runner.check_master()
+	
+	print_site_info(runner)
+	
+	if not check_deploy_site(assumeyes, site, total_number, controller_number, compute_number, others_number):
+		print('Exiting on user Command')
+		sys.exit(1)
+		
+	reset_app_start_time()
+	
+	runner.wait_for_fuel_server()
+	time.sleep(30)
+	runner.check_master()
+		
+	fuel_nodes = runner.get_all_fuel_nodes()
+	if len(fuel_nodes) > 0:
+		print('Slave nodes already exist on site {0}. Exiting ...'.format(site))
+		sys.exit(1)
+	
+	env_name, env_id = runner.create_fuel_env(env_name, 
+											release=release_name,
+											deploy_mode=deploy_mode,
+											network_mode=network_mode)
+	print("Environment '{name}' with id={id} was created!".format(name=env_name,
+																id=env_id))
+	
+	
+	for i in range(controller_number):
+		if i != 0:
+			time.sleep(30)
+		runner.create_slave(slave_cpu=controller_cpu, slave_ram=controller_ram, slave_disk=controller_disk)
+		
+		
+	for i in range(compute_number):
+		time.sleep(30)
+		runner.create_slave(slave_cpu=compute_cpu, slave_ram=compute_ram, slave_disk=compute_disk)
+		
+	for i in range(storage_number):
+		time.sleep(30)
+		runner.create_slave(slave_cpu=storage_cpu, slave_ram=storage_ram, slave_disk=storage_disk)
+		
+	discovered_nodes = discover_fuel_nodes(runner, total_number)
+	controller_ids, compute_ids, storage_ids = split_node_ids(discovered_nodes, controller_number, compute_number, storage_number)
+	
+	logging.info('controller_ids = ' + str(controller_ids))
+	logging.info('compute_ids = ' + str(compute_ids))
+	logging.info('storage_ids = ' + str(storage_ids))
+	
+	runner.add_fuel_nodes(node_ids=controller_ids, roles=['controller'])
+	runner.add_fuel_nodes(node_ids=compute_ids, roles=['compute'])
+	runner.add_fuel_nodes(node_ids=storage_ids, roles=['cinder'])
+
+	runner.deploy_changes()
+	
+	runner.print_access_info(show_horizon=True)
+	
+	print()
+	print('Deploy successful!')
+	print_time_summary()
+
+def restore_command(args):
+	assumeyes = args.assumeyes
+	site = check_user_site(args)
+
+	runner = DefaultFuelBench(site)
+
+	print_site_info(runner)
+
+	if not check_current_site(runner, assumeyes):
+		print('Exiting on user Command')
+		sys.exit(1)	
+		
+	reset_app_start_time()
+
+	runner.clean_slaves()
+	runner.restore_master()	
+	
+	print()
+	print('Restore successful!')
+	print_time_summary()	
+	
+def clean_command(args):
+	assumeyes = args.assumeyes
+	site = check_user_site(args)
+
+	runner = DefaultFuelBench(site)
+
+	print_site_info(runner)
+
+	if not check_current_site(runner, assumeyes):
+		print('Exiting on user Command')
+		sys.exit(1)	
+		
+	reset_app_start_time()
+	
+	runner.clean()
+	
+	print()
+	print('Clean successful!')
+	print_time_summary()
+
+def init_env():
+	if not os.path.exists(settings.DATA_DIR):
+		os.makedirs(settings.DATA_DIR)
+		
+	if not os.path.exists(settings.LOG_DIR):
+		os.makedirs(settings.LOG_DIR)
+		
+	if not os.path.exists(settings.IMAGE_DIR):
+		os.makedirs(settings.IMAGE_DIR)
+	
+	if not os.path.exists(settings.TEMP_DIR):
+		os.makedirs(settings.TEMP_DIR)
+		
+	if not os.path.exists(settings.SITE_DIR):
+		os.makedirs(settings.SITE_DIR)
+		
+def config_logger():
+	if settings.DEBUG:
+		log_level = logging.DEBUG
+	else:
+		log_level = logging.INFO
+	
+	logging.basicConfig(filename=settings.APP_LOG,
+						format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+						level=log_level)
+	logging.info('Starting FuelBench v{0}'.format(APP_VERSION))
+
+def main():
+	parser = argparse.ArgumentParser(description='The Automated Testing Toolkit for Fuel-based OpenStack v{0}'.format(APP_VERSION))
+	subparsers = parser.add_subparsers()
+
+	common_opts = argparse.ArgumentParser(add_help=False)
+	common_opts.add_argument('-y', '--assumeyes', action='store_true',
+							   help="answer yes for all questions")
+	common_opts.add_argument('--site', metavar='ID', type=int,
+							   help="id of site on the host")
+	
+	install_opts = argparse.ArgumentParser(add_help=False)
+	install_opts.add_argument('--iso', metavar='FILE',
+							help="specify an ISO image file to install a master node")
+	install_opts.add_argument('--master-cpu', metavar='COUNT', type=int,
+							help="vCPUs for master node")
+	install_opts.add_argument('--master-ram', metavar='MB', type=int,
+							help="RAM size for master node")
+	install_opts.add_argument('--master-disk', metavar='GB', type=int,
+							help="Disk size for master node")
+ 	install_opts.add_argument('--disable-public', dest='disable_public', action='store_true',
+ 							help='enable the public network interface for fuel master')	
+ 	install_opts.add_argument('--disable-snapshot', '-N', dest='disable_snapshot', action='store_true',
+ 							help='do not create snapshot for fuel master recovery')	
+	
+	deploy_opts = argparse.ArgumentParser(add_help=False)
+	deploy_opts.add_argument('--controller', metavar='NUM', type=int,
+							help="number of controller nodes")
+	deploy_opts.add_argument('--controller-cpu', metavar='COUNT', type=int,
+							help="vCPUs for controller node")
+	deploy_opts.add_argument('--controller-ram', metavar='MB', type=int,
+							help="RAM size for controller node")
+	deploy_opts.add_argument('--controller-disk', metavar='GB', type=int,
+							help="Disk size for controller node")
+	deploy_opts.add_argument('--compute', metavar='NUM', type=int,
+							help="number of compute nodes")
+	deploy_opts.add_argument('--compute-cpu', metavar='COUNT', type=int,
+							help="vCPUs for compute node")
+	deploy_opts.add_argument('--compute-ram', metavar='MB', type=int,
+							help="RAM size for compute node")
+	deploy_opts.add_argument('--compute-disk', metavar='GB', type=int,
+							help="Disk size for compute node")
+	deploy_opts.add_argument('--storage', metavar='NUM', type=int,
+							help="number of storage nodes")
+	deploy_opts.add_argument('--storage-cpu', metavar='COUNT', type=int,
+							help="vCPUs for storage node")
+	deploy_opts.add_argument('--storage-ram', metavar='MB', type=int,
+							help="RAM size for storage node")
+	deploy_opts.add_argument('--storage-disk', metavar='GB', type=int,
+							help="Disk size for storage node")
+	deploy_opts.add_argument('--env-name', metavar='NAME',
+							help="set your testing environment name")
+	deploy_opts.add_argument('--release', '--rel', choices=['ubuntu', 'centos'],
+							help='specify a release OS to deploy')
+	deploy_opts.add_argument('--mode', choices=['ha'],
+							help="set deployment mode for specific environment")
+	deploy_opts.add_argument('--network', choices=['nova', 'neutron-vlan', 'neutron-gre'],
+							help="set network mode for specific environment")
+	
+	parser_create = subparsers.add_parser('create', parents=[common_opts, install_opts, deploy_opts],
+							help="create a Fuel master and an OpenStack environment")
+	parser_create.set_defaults(func=create_command)
+	
+	parser_deploy = subparsers.add_parser('deploy', parents=[common_opts, deploy_opts],
+							help="deploy an OpenStack environment")
+	parser_deploy.set_defaults(func=deploy_command)		
+
+	parser_install = subparsers.add_parser('install', parents=[common_opts, install_opts],
+										help="install a fuel master node")
+	parser_install.set_defaults(func=install_command)
+	
+	parser_clean = subparsers.add_parser('restore', parents=[common_opts],
+										help="restore the specified site")
+	parser_clean.set_defaults(func=restore_command)	
+	
+	parser_clean = subparsers.add_parser('clean', parents=[common_opts],
+										help="clean the specified site")
+	parser_clean.set_defaults(func=clean_command)
+
+	args = parser.parse_args()
+	init_env()
+	config_logger()
+	
+	args.func(args)
+
+
+def clean_up():
+	logging.info('Exiting FuelBench v{0}'.format(APP_VERSION))
+
+
+app_start_time = time.time()
+
+
+if __name__ == "__main__":
+	try:
+		main()
+	except SystemExit as sys_e:
+		sys.exit(sys_e.code)
+	except KeyboardInterrupt:
+		print('Aborted at user request', file=sys.stderr)
+		sys.exit(1)
+	finally:
+		clean_up()

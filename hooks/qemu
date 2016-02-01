@@ -1,0 +1,29 @@
+#!/bin/bash
+
+host_dev='br0'
+site_num=`echo ${1} | grep -oP '(?<=site)\d{1,2}(?=-master)'`
+res=$?
+
+if [ ${res} = 0 ]; then
+    suffix=`printf "%02d" ${site_num}`
+
+    guest_ipaddr=("10.20.${site_num}.2" "172.16.${site_num}.2" "10.20.${site_num}.2" "172.16.${site_num}.2" "172.16.${site_num}.3" "172.16.${site_num}.4" "172.16.${site_num}.3" "172.16.${site_num}.4")
+    guest_port=("22" "22" "8000" "8000" "80" "80" "443" "443")
+    host_port=("122${suffix}" "123${suffix}" "188${suffix}" "189${suffix}" "180${suffix}" "181${suffix}" "184${suffix}" "185${suffix}")
+
+    length=$(( ${#host_port[@]} - 1 ))
+
+    if [ "${2}" = "stopped" ] || [ "${2}" = "reconnect" ]; then
+        for i in `seq 0 ${length}`; do
+            iptables -t nat -D PREROUTING -i $host_dev -p tcp --dport ${host_port[$i]} -j DNAT --to ${guest_ipaddr[$i]}:${guest_port[$i]}
+            iptables -D FORWARD -d ${guest_ipaddr[$i]}/32 -p tcp -m state --state NEW -m tcp --dport ${guest_port[$i]} -j ACCEPT
+        done
+    fi
+    if [ "${2}" = "start" ] || [ "${2}" = "reconnect" ]; then
+        for i in `seq 0 ${length}`; do
+            iptables -t nat -A PREROUTING -i $host_dev -p tcp --dport ${host_port[$i]} -j DNAT --to ${guest_ipaddr[$i]}:${guest_port[$i]}
+            iptables -I FORWARD -d ${guest_ipaddr[$i]}/32 -p tcp -m state --state NEW -m tcp --dport ${guest_port[$i]} -j ACCEPT
+        done
+    fi
+fi
+
